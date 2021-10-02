@@ -197,7 +197,7 @@ def finetune_18(save_path, base_model=None, image_size=224, batch_size=2048, tes
 
 
 if __name__ == '__main__':
-#    finetune('data/resnet.h5')
-#    finetune_18('data/resnet_18.h5', 'data/resnet.h5', w_mix=0.8)
-finetune('data/resnet.h5', n_epochs=2, max_patience=1)
-finetune_18('data/resnet_18.h5', 'data/resnet.h5', w_mix=0.8, n_epochs=2, max_patience=1)
+    finetune('data/resnet.h5')
+    finetune_18('data/resnet_18_ffhq_cfg.h5', 'data/resnet.h5', w_mix=0.8)
+    #finetune('data/resnet.h5', n_epochs=2, max_patience=1)
+    #finetune_18('data/resnet_18_ffhq_cfg.h5', 'data/resnet.h5', w_mix=0.8, n_epochs=2, max_patience=1)

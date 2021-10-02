@@ -169,7 +169,6 @@ def init_uninitialized_vars(target_vars: List[tf.Variable] = None) -> None:
     """
     assert_tf_initialized()
     if target_vars is None:
-        # 将 tf 的全部变量赋值给 target_vars
         target_vars = tf.global_variables()
 
     test_vars = []
@@ -183,17 +182,12 @@ def init_uninitialized_vars(target_vars: List[tf.Variable] = None) -> None:
                 tf.get_default_graph().get_tensor_by_name(var.name.replace(":0", "/IsVariableInitialized:0"))
             except KeyError:
                 # Op does not exist => variable may be uninitialized.
-                # 操作不存在 => 变量也许未被初始化
-                # 将 var 加入 test_vars 列表
                 test_vars.append(var)
 
                 with absolute_name_scope(var.name.split(":")[0]):
-                    # 将 var 是否已初始化的状态标志加入 test_ops 列表
                     test_ops.append(tf.is_variable_initialized(var))
 
-    # 把 test_vars 列表中的未初始化的变量赋值给 init_vars
     init_vars = [var for var, inited in zip(test_vars, run(test_ops)) if not inited]
-    # 初始化变量
     run([var.initializer for var in init_vars])
 
 
@@ -243,7 +237,7 @@ def convert_images_from_uint8(images, drange=[-1,1], nhwc_to_nchw=False):
     return images * ((drange[1] - drange[0]) / 255) + drange[0]
 
 
-def convert_images_to_uint8(images, drange=[-1,1], nchw_to_nhwc=False, shrink=1, uint8_cast=True):
+def convert_images_to_uint8(images, drange=[-1,1], nchw_to_nhwc=False, shrink=1):
     """Convert a minibatch of images from float32 to uint8 with configurable dynamic range.
     Can be used as an output transformation for Network.run().
     """
@@ -255,6 +249,4 @@ def convert_images_to_uint8(images, drange=[-1,1], nchw_to_nhwc=False, shrink=1,
         images = tf.transpose(images, [0, 2, 3, 1])
     scale = 255 / (drange[1] - drange[0])
     images = images * scale + (0.5 - drange[0] * scale)
-    if uint8_cast:
-        images = tf.saturate_cast(images, tf.uint8)
-    return images
+    return tf.saturate_cast(images, tf.uint8)

@@ -196,23 +196,18 @@ def get_module_from_obj_name(obj_name: str) -> Tuple[types.ModuleType, str]:
     Returns the module and the object name (original name with module part removed)."""
 
     # allow convenience shorthands, substitute them by full names
-    # 将obj_name中的np.用numpy.代替，将tf.用tensorflow.代替
     obj_name = re.sub("^np.", "numpy.", obj_name)
     obj_name = re.sub("^tf.", "tensorflow.", obj_name)
 
     # list alternatives for (module_name, local_obj_name)
-    # 用"."把obj_name分成若干部分，保存在parts list里
-    # 举例："a.b.c"-->['a','b','c']
     parts = obj_name.split(".")
-    # 倒着数，从len(parts)数到1
-    # 举例：['a','b','c']-->[('a.b.c', ''), ('a.b', 'c'), ('a', 'b.c')]
     name_pairs = [(".".join(parts[:i]), ".".join(parts[i:])) for i in range(len(parts), 0, -1)]
 
     # try each alternative in turn
     for module_name, local_obj_name in name_pairs:
         try:
             module = importlib.import_module(module_name) # may raise ImportError
-            get_obj_from_module(module, local_obj_name)   # may raise AttributeError
+            get_obj_from_module(module, local_obj_name) # may raise AttributeError
             return module, local_obj_name
         except:
             pass
@@ -229,7 +224,7 @@ def get_module_from_obj_name(obj_name: str) -> Tuple[types.ModuleType, str]:
     for module_name, local_obj_name in name_pairs:
         try:
             module = importlib.import_module(module_name) # may raise ImportError
-            get_obj_from_module(module, local_obj_name)   # may raise AttributeError
+            get_obj_from_module(module, local_obj_name) # may raise AttributeError
         except ImportError:
             pass
 
@@ -243,7 +238,6 @@ def get_obj_from_module(module: types.ModuleType, obj_name: str) -> Any:
         return module
     obj = module
     for part in obj_name.split("."):
-        # 得到一个直到运行时才知道名称的函数的引用（最后一个对象/最右侧）
         obj = getattr(obj, part)
     return obj
 

@@ -6,6 +6,7 @@
 
 """Helper wrapper for a Tensorflow optimizer."""
 
+import platform
 import numpy as np
 import tensorflow as tf
 
@@ -18,12 +19,9 @@ from .. import util
 
 from .tfutil import TfExpression, TfExpressionEx
 
-try:
-    # TensorFlow 1.13
-    from tensorflow.python.ops import nccl_ops
-except:
-    # Older TensorFlow versions
-    import tensorflow.contrib.nccl as nccl_ops
+_collective_ops_warning_printed = False
+_collective_ops_group_key       = 831766147
+_collective_ops_instance_key    = 436340067
 
 class Optimizer:
     """A Wrapper for tf.train.Optimizer.
@@ -116,12 +114,10 @@ class Optimizer:
         Intended to be called once per GPU."""
         tfutil.assert_tf_initialized()
         assert not self._updates_applied
-        # 读取GPU设备号
         device = self._get_device(loss.device)
 
         # Validate trainables.
         if isinstance(trainable_vars, dict):
-            # 把tensor转换为元组，以进行计算
             trainable_vars = list(trainable_vars.values())  # allow passing in Network.trainables as vars
         assert isinstance(trainable_vars, list) and len(trainable_vars) >= 1
         assert all(tfutil.is_tf_expression(expr) for expr in trainable_vars + [loss])
@@ -129,7 +125,6 @@ class Optimizer:
 
         # Validate shapes.
         if self._gradient_shapes is None:
-            # var.shape.aslist()获取元组类型 var 的 shape
             self._gradient_shapes = [var.shape.as_list() for var in trainable_vars]
         assert len(trainable_vars) == len(self._gradient_shapes)
         assert all(var.shape.as_list() == var_shape for var, var_shape in zip(trainable_vars, self._gradient_shapes))
@@ -145,18 +140,12 @@ class Optimizer:
                 pass
 
         # Compute gradients.
-        # compute_gradients调用tf.gradients()为loss添加梯度和变量
         with tf.name_scope(self.id + "_grad"), tf.device(device.name), tf.control_dependencies(deps):
-            # 应用动态损失尺度放大，loss数据类型是 float32，取值范围 [-3.4 * 10**38, 3.4 * 10**38]
-            # loss = loss * 2**(loss_scaling_var)， loss_scaling_init = 64，放大倍数大约是 1.84 * 10**19 = √3.4 * 10**38
             loss = self.apply_loss_scaling(tf.cast(loss, tf.float32))
-            # 并发，不等待
             gate = tf.train.Optimizer.GATE_NONE  # disable gating to reduce memory usage
-            # 计算梯度
             grad_list = device.optimizer.compute_gradients(loss=loss, var_list=trainable_vars, gate_gradients=gate)
 
         # Register gradients.
-        # 把所有梯度都登记到device.grad_raw[]中
         for grad, var in grad_list:
             if var not in device.grad_raw:
                 device.grad_raw[var] = []
@@ -175,7 +164,6 @@ class Optimizer:
                 return tf.no_op(name='TrainingOp')
 
         # Clean up gradients.
-        # 清洁梯度
         for device_idx, device in enumerate(self._devices.values()):
             with tfutil.absolute_name_scope(self.scope + "/Clean%d" % device_idx), tf.device(device.name):
                 for var, grad in device.grad_raw.items():
@@ -190,35 +178,27 @@ class Optimizer:
                     elif len(grad) == 1:
                         grad = grad[0]              # Single gradient => use as is.
                     else:
-                        grad = tf.add_n(grad)       # Multiple gradients => sum. 求和
+                        grad = tf.add_n(grad)       # Multiple gradients => sum.
 
                     # Scale as needed.
-                    # 调整尺度
-                    scale = 1.0 / len(device.grad_raw[var]) / len(self._devices)  # 除以梯度分量个数（即：d(y1+y2+...+ym）/dxn 中的 m，除以GPU个数
+                    scale = 1.0 / len(device.grad_raw[var]) / len(self._devices)
                     scale = tf.constant(scale, dtype=tf.float32, name="scale")
                     if self.minibatch_multiplier is not None:
-                        scale /= tf.cast(self.minibatch_multiplier, tf.float32)   # 除以minibatch_multiplier，一组GPU处理完一个minibatch所需的循环次数
-                    # 如果使用了 mixed precision training（混合精度训练），则撤销动态损失尺度放大的效果
-                    # scale = scale * 2**(-loss_scaling_var)， loss_scaling_init = 64，撤销的放大倍数大约是 1.84 * 10**19 = √3.4 * 10**38
+                        scale /= tf.cast(self.minibatch_multiplier, tf.float32)
                     scale = self.undo_loss_scaling(scale)
-                    # 赋值给grad_clean[var]
                     device.grad_clean[var] = grad * scale
 
         # Sum gradients across devices.
-        # 对多个GPU上的梯度求和
         if len(self._devices) > 1:
             with tfutil.absolute_name_scope(self.scope + "/Broadcast"), tf.device(None):
-                for all_vars in zip(*[device.grad_clean.keys() for device in self._devices.values()]):
-                    if len(all_vars) > 0 and all(dim > 0 for dim in all_vars[0].shape.as_list()): # NCCL does not support zero-sized tensors.
-                        all_grads = [device.grad_clean[var] for device, var in zip(self._devices.values(), all_vars)]
-                        # 求和
-                        all_grads = nccl_ops.all_sum(all_grads)
-                        # 为每个 grad_clean[var] 赋值 all_grads[var]
-                        for device, var, grad in zip(self._devices.values(), all_vars, all_grads):
-                            device.grad_clean[var] = grad
+                if platform.system() == "Windows":    # Windows => NCCL ops are not available.
+                    self._broadcast_fallback()
+                elif tf.VERSION.startswith("1.15."):  # TF 1.15 => NCCL ops are broken: https://github.com/tensorflow/tensorflow/issues/41539
+                    self._broadcast_fallback()
+                else:                                 # Otherwise => NCCL ops are safe to use.
+                    self._broadcast_nccl()
 
         # Apply updates separately on each device.
-        # 逐个GPU分别进行更新，使用 grad_clean[]
         for device_idx, device in enumerate(self._devices.values()):
             with tfutil.absolute_name_scope(self.scope + "/Apply%d" % device_idx), tf.device(device.name):
                 # pylint: disable=cell-var-from-loop
@@ -228,7 +208,6 @@ class Optimizer:
                     acc_ok = tf.constant(True, name='acc_ok')
                     device.grad_acc = OrderedDict(device.grad_clean)
                 else:
-                    # 如果一组GPU处理完一个minibatch所需的循环次数 > 1，则将结果累计求和
                     # Create variables.
                     with tf.control_dependencies(None):
                         for var in device.grad_clean.keys():
@@ -253,13 +232,11 @@ class Optimizer:
                             all_ops.append(tf.cond(acc_ok, acc_reset_op, acc_inc_op))
 
                 # No overflow => apply gradients.
-                # 如果计算结果没有溢出 => 应用梯度
                 all_ok = tf.reduce_all(tf.stack([acc_ok] + [tf.reduce_all(tf.is_finite(g)) for g in device.grad_acc.values()]))
                 apply_op = lambda: device.optimizer.apply_gradients([(tf.cast(grad, var.dtype), var) for var, grad in device.grad_acc.items()])
                 all_ops.append(tf.cond(all_ok, apply_op, tf.no_op))
 
                 # Adjust loss scaling.
-                # 若使用了 loss scaling，如果acc_ok == TRUE（无溢出），则loss_scaling_var + 0.0005，否则loss_scaling_var - 1
                 if self.use_loss_scaling:
                     ls_inc_op = lambda: tf.assign_add(device.loss_scaling_var, self.loss_scaling_inc)
                     ls_dec_op = lambda: tf.assign_sub(device.loss_scaling_var, self.loss_scaling_dec)
@@ -268,13 +245,12 @@ class Optimizer:
 
                 # Last device => report statistics.
                 if device_idx == len(self._devices) - 1:
-                    all_ops.append(autosummary.autosummary(self.id + "/learning_rate", self.learning_rate))
+                    all_ops.append(autosummary.autosummary(self.id + "/learning_rate", tf.convert_to_tensor(self.learning_rate)))
                     all_ops.append(autosummary.autosummary(self.id + "/overflow_frequency", tf.where(all_ok, 0, 1), condition=acc_ok))
                     if self.use_loss_scaling:
                         all_ops.append(autosummary.autosummary(self.id + "/loss_scaling_log2", device.loss_scaling_var))
 
         # Initialize variables.
-        # 初始化变量
         self.reset_optimizer_state()
         if self.use_loss_scaling:
             tfutil.init_uninitialized_vars([device.loss_scaling_var for device in self._devices.values()])
@@ -296,7 +272,6 @@ class Optimizer:
 
     def apply_loss_scaling(self, value: TfExpression) -> TfExpression:
         """Apply dynamic loss scaling for the given expression."""
-        # 应用动态损失尺度调整
         assert tfutil.is_tf_expression(value)
         if not self.use_loss_scaling:
             return value
@@ -304,12 +279,46 @@ class Optimizer:
 
     def undo_loss_scaling(self, value: TfExpression) -> TfExpression:
         """Undo the effect of dynamic loss scaling for the given expression."""
-        # 撤销动态损失尺度调整的效果
         assert tfutil.is_tf_expression(value)
         if not self.use_loss_scaling:
-            return
-        # value * 2**(-loss_scaling_var)
+            return value
         return value * tfutil.exp2(-self.get_loss_scaling_var(value.device)) # pylint: disable=invalid-unary-operand-type
+
+    def _broadcast_nccl(self):
+        """Sum gradients across devices using NCCL ops (fast path)."""
+        from tensorflow.python.ops import nccl_ops # pylint: disable=no-name-in-module
+        for all_vars in zip(*[device.grad_clean.keys() for device in self._devices.values()]):
+            if any(x.shape.num_elements() > 0 for x in all_vars):
+                all_grads = [device.grad_clean[var] for device, var in zip(self._devices.values(), all_vars)]
+                all_grads = nccl_ops.all_sum(all_grads)
+                for device, var, grad in zip(self._devices.values(), all_vars, all_grads):
+                    device.grad_clean[var] = grad
+
+    def _broadcast_fallback(self):
+        """Sum gradients across devices using TensorFlow collective ops (slow fallback path)."""
+        from tensorflow.python.ops import collective_ops # pylint: disable=no-name-in-module
+        global _collective_ops_warning_printed, _collective_ops_group_key, _collective_ops_instance_key
+        if all(x.shape.num_elements() == 0 for device in self._devices.values() for x in device.grad_clean.values()):
+            return
+        if not _collective_ops_warning_printed:
+            print("------------------------------------------------------------------------")
+            print("WARNING: Using slow fallback implementation for inter-GPU communication.")
+            print("Please use TensorFlow 1.14 on Linux for optimal training performance.")
+            print("------------------------------------------------------------------------")
+            _collective_ops_warning_printed = True
+        for device in self._devices.values():
+            with tf.device(device.name):
+                combo = [tf.reshape(x, [x.shape.num_elements()]) for x in device.grad_clean.values()]
+                combo = tf.concat(combo, axis=0)
+                combo = collective_ops.all_reduce(combo, merge_op='Add', final_op='Id',
+                    group_size=len(self._devices), group_key=_collective_ops_group_key,
+                    instance_key=_collective_ops_instance_key)
+                cur_ofs = 0
+                for var, grad_old in device.grad_clean.items():
+                    grad_new = tf.reshape(combo[cur_ofs : cur_ofs + grad_old.shape.num_elements()], grad_old.shape)
+                    cur_ofs += grad_old.shape.num_elements()
+                    device.grad_clean[var] = grad_new
+        _collective_ops_instance_key += 1
 
 
 class SimpleAdam:
@@ -327,12 +336,7 @@ class SimpleAdam:
         return self.all_state_vars
 
     def compute_gradients(self, loss, var_list, gate_gradients=tf.train.Optimizer.GATE_NONE):
-        # GATE_NONE：不等待并发。
-        # 并行地计算和应用梯度。提供最大化的并行执行，但是会导致有的数据结果没有再现性。
-        # 比如两个matmul操作的梯度依赖输入值，使用GATE_NONE可能会出现有一个梯度在其他梯度之前便应用到某个输入中，导致出现不可再现的(non-reproducible)结果
         assert gate_gradients == tf.train.Optimizer.GATE_NONE
-        # tf.gradients(loss, var_list)，求loss对于var_list的梯度（导数）
-        # 返回值是两个list，前面一个是梯度，后面一个是变量
         return list(zip(tf.gradients(loss, var_list), var_list))
 
     def apply_gradients(self, grads_and_vars):

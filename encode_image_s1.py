@@ -14,6 +14,16 @@ from keras.models import load_model
 import glob
 import random
 
+def str2bool(v):
+    if isinstance(v, bool):
+       return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
 
 def split_to_batches(l, n):
     for i in range(0, len(l), n):
@@ -39,6 +49,7 @@ def main():
 
     # Perceptual model params
     parser.add_argument('--image_size', default=256, help='Size of images for perceptual model', type=int)
+    parser.add_argument('--sharpen_input', default=True, help='whether to add sharpen action for input images', type=bool)
     parser.add_argument('--resnet_image_size', default=224, help='Size of images for the Resnet model', type=int)
     parser.add_argument('--lr', default=0.02, help='Learning rate for perceptual model', type=float)
     parser.add_argument('--decay_rate', default=0.9, help='Decay rate for learning rate', type=float)
@@ -53,6 +64,9 @@ def main():
     # Loss function options
     parser.add_argument('--use_vgg_loss', default=0.4, help='Use VGG perceptual loss; 0 to disable, > 0 to scale.',
                         type=float)
+    parser.add_argument('--use_adaptive_loss', default=False,
+                        help='Use the adaptive robust loss function from Google Research for pixel and VGG feature loss.',
+                        type=str2bool, nargs='?', const=True)
     parser.add_argument('--use_vgg_layer', default=9, help='Pick which VGG layer to use.', type=int)
     parser.add_argument('--use_pixel_loss', default=1.5,
                         help='Use logcosh image pixel loss; 0 to disable, > 0 to scale.', type=float)
@@ -61,6 +75,8 @@ def main():
     parser.add_argument('--use_lpips_loss', default=100, help='Use LPIPS perceptual loss; 0 to disable, > 0 to scale.',
                         type=float)
     parser.add_argument('--use_l1_penalty', default=1, help='Use L1 penalty on latents; 0 to disable, > 0 to scale.',
+                        type=float)
+    parser.add_argument('--use_discriminator_loss', default=0.5, help='Use trained discriminator to evaluate realism.',
                         type=float)
 
     # Generator params
@@ -142,7 +158,7 @@ def main():
 
     # 创建VGG16 perceptual模型
     perceptual_model = PerceptualModel(args, perc_model=perc_model, batch_size=args.batch_size)
-    perceptual_model.build_perceptual_model(generator)
+    perceptual_model.build_perceptual_model(generator, discriminator_network)
 
     ff_model = None
     # Optimize (only) dlatents by minimizing perceptual loss between reference and generated images in feature space
@@ -228,5 +244,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
